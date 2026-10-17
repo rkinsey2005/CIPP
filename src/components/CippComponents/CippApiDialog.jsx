@@ -16,6 +16,16 @@ import { useForm, useFormState } from 'react-hook-form'
 import { useSettings } from '../../hooks/use-settings'
 import CippFormComponent from './CippFormComponent'
 import { CippFormCondition } from './CippFormCondition'
+import {
+  getNestedValue as getRowPath,
+  getRowTenant,
+  withRowTenant,
+} from '../../utils/resolve-row-templates'
+import {
+  extractCsvColumnValues,
+  mergeCsvFormFields,
+  normalizeAutoCompleteValues,
+} from '../../utils/csv-field-values'
 
 export const CippApiDialog = (props) => {
   const {
@@ -29,6 +39,10 @@ export const CippApiDialog = (props) => {
     allowResubmit = false,
     children,
     defaultvalues,
+    // Optional. Supplying a form lets the caller watch and drive the dialog's fields while it is
+    // open - the custom variables page uses it to default a variable's type from how the same name
+    // is typed elsewhere. Omitted, the dialog owns its form exactly as before.
+    formHook: externalFormHook,
     ...other
   } = props
   const router = useRouter()
@@ -42,10 +56,11 @@ export const CippApiDialog = (props) => {
     other.fullScreen = true
   }
 
-  const formHook = useForm({
+  const internalFormHook = useForm({
     defaultValues: typeof defaultvalues === 'function' ? defaultvalues(row) : defaultvalues || {},
     mode: 'onChange', // Enable real-time validation
   })
+  const formHook = externalFormHook ?? internalFormHook
 
   // Get form state for validation
   const { isValid } = useFormState({ control: formHook.control })
@@ -70,9 +85,9 @@ export const CippApiDialog = (props) => {
     urlFromData: true,
     relatedQueryKeys: relatedQueryKeys ?? api.relatedQueryKeys ?? title,
     bulkRequest: api.multiPost === false,
-    onResult: (result) => {
+    onResult: (result, meta) => {
       setPartialResults((prev) => [...prev, result])
-      api?.onSuccess?.(result)
+      if (!meta?.failed) api?.onSuccess?.(result)
     },
   })
 
@@ -80,9 +95,9 @@ export const CippApiDialog = (props) => {
     ...getRequestInfo,
     relatedQueryKeys: relatedQueryKeys ?? api.relatedQueryKeys ?? title,
     bulkRequest: api.multiPost === false,
-    onResult: (result) => {
+    onResult: (result, meta) => {
       setPartialResults((prev) => [...prev, result])
-      api?.onSuccess?.(result)
+      if (!meta?.failed) api?.onSuccess?.(result)
     },
   })
 
@@ -116,7 +131,8 @@ export const CippApiDialog = (props) => {
       if (typeof value === 'string' && value.startsWith('!')) {
         newData[key] = value.slice(1)
       } else if (typeof value === 'string') {
-        newData[key] = row[value] ?? value
+        const nested = getRowPath(row, value)
+        newData[key] = nested !== undefined ? nested : value
       } else if (typeof value === 'boolean') {
         newData[key] = value
       } else if (typeof value === 'object' && value !== null) {
@@ -133,31 +149,24 @@ export const CippApiDialog = (props) => {
   }
 
   const tenantFilter = useSettings().currentTenant
-  const handleActionClick = (row, action, formData) => {
+
+  const handleActionClick = (row, action, rawFormData) => {
     setIsFormSubmitted(true)
+    // The typed-confirmation field only gates the submit button; it never reaches the API.
+    const { __confirmPhrase, ...formData } = rawFormData ?? {}
+    const resolvedFormData = mergeCsvFormFields(formData, fields)
     let finalData = {}
     let isBulkRequest = false
     if (typeof api?.customDataformatter === 'function') {
-      finalData = api.customDataformatter(row, action, formData)
-      // If customDataformatter returns an array, enable bulk request mode
+      finalData = api.customDataformatter(row, action, resolvedFormData)
       isBulkRequest = Array.isArray(finalData)
     } else {
       if (action.multiPost === undefined) action.multiPost = false
 
       if (api.customFunction) {
-        action.customFunction(row, action, formData)
+        action.customFunction(row, action, resolvedFormData)
         createDialog.handleClose()
         return
-      }
-
-      // Helper function to get the correct tenant filter for a row
-      const getRowTenantFilter = (rowData) => {
-        // If we're in AllTenants mode and the row has a Tenant property, use that
-        if (tenantFilter === 'AllTenants' && rowData?.Tenant) {
-          return rowData.Tenant
-        }
-        // Otherwise use the current tenant filter
-        return tenantFilter
       }
 
       const processedActionData = processActionData(action.data, row, action.replacementBehaviour)
@@ -169,14 +178,16 @@ export const CippApiDialog = (props) => {
         if (Array.isArray(row)) {
           const arrayData = row.map((singleRow) => {
             const commonData = {
-              tenantFilter: getRowTenantFilter(singleRow),
-              ...formData,
+              tenantFilter: getRowTenant(singleRow, tenantFilter),
+              ...resolvedFormData,
               ...addedFieldData,
             }
             const itemData = { ...commonData }
             Object.keys(processedActionData).forEach((key) => {
-              const rowValue = singleRow[processedActionData[key]]
-              itemData[key] = rowValue !== undefined ? rowValue : processedActionData[key]
+              const mapped = processedActionData[key]
+              const rowValue =
+                typeof mapped === 'string' ? getRowPath(singleRow, mapped) : undefined
+              itemData[key] = rowValue !== undefined ? rowValue : mapped
             })
             return itemData
           })
@@ -203,12 +214,11 @@ export const CippApiDialog = (props) => {
 
       // SINGLE ROW CASE
       const commonData = {
-        tenantFilter: getRowTenantFilter(row),
-        ...formData,
+        tenantFilter: getRowTenant(row, tenantFilter),
+        ...resolvedFormData,
         ...addedFieldData,
       }
 
-      // ✅ FIXED: DIRECT MERGE INSTEAD OF CORRUPT TRANSFORMATION
       finalData = {
         ...commonData,
         ...processedActionData,
@@ -278,23 +288,13 @@ export const CippApiDialog = (props) => {
     }
   }, [createDialog.open, api?.setDefaultValues])
 
-  const escapeHtml = (text) => {
-    if (typeof text !== 'string') return text
-    const div = document.createElement('div')
-    div.textContent = text
-    return div.innerHTML
-  }
-
+  // Values land in React text nodes, which escape on render; pre-escaping shows &amp; to the user.
   const getRawNestedValue = (obj, path) => {
     return path
       .split('.')
       .reduce((acc, key) => (acc && acc[key] !== undefined ? acc[key] : undefined), obj)
   }
-
-  const getNestedValue = (obj, path) => {
-    const value = getRawNestedValue(obj, path)
-    return typeof value === 'string' ? escapeHtml(value) : value
-  }
+  const getNestedValue = getRawNestedValue
 
   // Handle link actions - opens the link when dialog opens, using ref to prevent duplicates
   useEffect(() => {
@@ -306,14 +306,23 @@ export const CippApiDialog = (props) => {
       !linkOpenedRef.current
     ) {
       linkOpenedRef.current = true
-      const linkWithData = api.link.replace(
-        /\[([^\]]+)\]/g,
-        (_, key) => getRawNestedValue(row, key) || `[${key}]`
-      )
-      if (linkWithData.startsWith('/') && !api?.external) {
-        router.push(linkWithData, undefined, { shallow: true })
+      const placeholder = /\[([^\]]+)\]/g
+      const hasValue = (value) => value !== undefined && value !== null && value !== ''
+      if (api.link.startsWith('/') && !api?.external) {
+        // Internal routes only ever substitute ids and query values, so encode them: the row
+        // is tenant data and must not be able to inject path segments or a second origin.
+        const internalLink = api.link.replace(placeholder, (_, key) => {
+          const value = getRawNestedValue(row, key)
+          return hasValue(value) ? encodeURIComponent(String(value)) : `[${key}]`
+        })
+        router.push(withRowTenant(internalLink, row, tenantFilter), undefined, { shallow: true })
       } else {
-        window.open(linkWithData, api.target || '_blank')
+        // External links may substitute a whole URL (e.g. [webUrl]) and are left as-is.
+        const externalLink = api.link.replace(placeholder, (_, key) => {
+          const value = getRawNestedValue(row, key)
+          return hasValue(value) ? value : `[${key}]`
+        })
+        window.open(externalLink, api.target || '_blank')
       }
       createDialog.handleClose()
     }
@@ -363,9 +372,9 @@ export const CippApiDialog = (props) => {
             : element.replace(
                 /\[([^\]]+)\]/g,
                 (_, key) => getNestedValue(row[0], key) || `[${key}]`
-              )
+              );
         }
-        return element.replace(/\[([^\]]+)\]/g, (_, key) => getNestedValue(row, key) || `[${key}]`)
+        return element.replace(/\[([^\]]+)\]/g, (_, key) => getNestedValue(row, key) || `[${key}]`);
       }
       if (React.isValidElement(element)) {
         const newChildren = React.Children.map(element.props.children, replaceTextInElement)
@@ -374,6 +383,27 @@ export const CippApiDialog = (props) => {
       return element
     }
     confirmText = replaceTextInElement(api?.confirmText)
+  }
+
+  // Optional typed confirmation: api.confirmPhrase is a string (with [field] interpolation from
+  // the row) or a function of the row / selected rows returning the phrase, or null/'' to skip.
+  // While set, the Confirm button stays disabled until the user types the phrase exactly.
+  let confirmPhrase = null
+  if (api?.confirmPhrase) {
+    if (typeof api.confirmPhrase === 'function') {
+      confirmPhrase = api.confirmPhrase(row)
+    } else if (Array.isArray(row)) {
+      confirmPhrase =
+        row.length > 1
+          ? `CONFIRM ${row.length} ITEMS`
+          : api.confirmPhrase.replace(/\[([^\]]+)\]/g, (_, key) => getNestedValue(row[0], key) || '')
+    } else {
+      confirmPhrase = api.confirmPhrase.replace(
+        /\[([^\]]+)\]/g,
+        (_, key) => getNestedValue(row, key) || ''
+      )
+    }
+    if (typeof confirmPhrase !== 'string' || confirmPhrase.trim() === '') confirmPhrase = null
   }
 
   return (
@@ -399,23 +429,64 @@ export const CippApiDialog = (props) => {
                 ) : (
                   <>
                     {fields?.map((fieldProps, i) => {
-                      const { condition, ...rest } = fieldProps
-                      if (
-                        rest.api?.processFieldData &&
-                        rest.api?.data &&
-                        row &&
-                        !Array.isArray(row)
-                      ) {
-                        const processedData = processActionData(rest.api.data, row)
-                        rest.api = {
-                          ...rest.api,
-                          data: processedData,
-                          queryKey:
-                            rest.api.queryKey ?? `${rest.api.url}-${JSON.stringify(processedData)}`,
+                      const { condition, component, csvColumn, ...rest } = fieldProps
+
+                      if (csvColumn && rest.type === 'autoComplete') {
+                        const csvFieldName = `${rest.name}__csv`
+                        const origValidate = rest.validators?.validate
+                        rest.validators = {
+                          ...rest.validators,
+                          validate: (value, formValues) => {
+                            const hasAC = normalizeAutoCompleteValues(value).length > 0
+                            const csvRows = formValues[csvFieldName]
+                            const csvValues = extractCsvColumnValues(csvRows, csvColumn)
+                            const hasCsvValues = csvValues.length > 0
+                            const hasCsvRows =
+                              Array.isArray(csvRows) && csvRows.length > 0
+
+                            if (hasAC || hasCsvValues) {
+                              if (typeof origValidate === 'function' && hasAC) {
+                                return origValidate(value, formValues)
+                              }
+                              return true
+                            }
+                            if (hasCsvRows) {
+                              return `CSV must include a ${csvColumn} column with at least one value`
+                            }
+                            return `Select at least one option or upload a CSV with a ${csvColumn} column`
+                          },
+                          deps: [csvFieldName],
                         }
                       }
+
+                      if (rest.api) {
+                        let nextApi = rest.api
+                        if (
+                          nextApi.processFieldData &&
+                          nextApi.data &&
+                          row &&
+                          !Array.isArray(row)
+                        ) {
+                          const processedData = processActionData(nextApi.data, row)
+                          nextApi = {
+                            ...nextApi,
+                            data: processedData,
+                            queryKey:
+                              nextApi.queryKey ??
+                              `${nextApi.url}-${JSON.stringify(processedData)}`,
+                          }
+                        }
+                        if (nextApi.tenantFilter === undefined && nextApi.url) {
+                          nextApi = {
+                            ...nextApi,
+                            tenantFilter: getRowTenant(row, tenantFilter),
+                          }
+                        }
+                        rest.api = nextApi
+                      }
+                      const FieldComponent = component ?? CippFormComponent
                       const fieldElement = (
-                        <CippFormComponent
+                        <FieldComponent
                           formControl={formHook}
                           addedFieldData={addedFieldData}
                           setAddedFieldData={setAddedFieldData}
@@ -423,14 +494,30 @@ export const CippApiDialog = (props) => {
                           {...rest}
                         />
                       )
+
+                      const csvElement = csvColumn ? (
+                        <Box sx={{ mt: 1 }}>
+                          <CippFormComponent
+                            type="CSVReader"
+                            name={`${rest.name}__csv`}
+                            label={`Or upload a CSV with a ${csvColumn} column`}
+                            formControl={formHook}
+                          />
+                        </Box>
+                      ) : null
+
                       return (
                         <Box key={i} sx={{ width: '100%' }}>
                           {condition ? (
                             <CippFormCondition {...condition} formControl={formHook}>
                               {fieldElement}
+                              {csvElement}
                             </CippFormCondition>
                           ) : (
-                            fieldElement
+                            <>
+                              {fieldElement}
+                              {csvElement}
+                            </>
                           )}
                         </Box>
                       )
@@ -439,6 +526,22 @@ export const CippApiDialog = (props) => {
                 )}
               </Stack>
             </DialogContent>
+            {confirmPhrase && (
+              <DialogContent>
+                <CippFormComponent
+                  type="textField"
+                  name="__confirmPhrase"
+                  label={`Type ${confirmPhrase} to confirm`}
+                  formControl={formHook}
+                  autoComplete="off"
+                  validators={{
+                    validate: (value) =>
+                      (value ?? '').trim() === confirmPhrase ||
+                      `Type ${confirmPhrase} exactly to enable Confirm`,
+                  }}
+                />
+              </DialogContent>
+            )}
             <DialogContent>
               <CippApiResults apiObject={{ ...selectedType, data: partialResults }} />
             </DialogContent>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { CippIcons } from '../../utils/icon-registry'
 import {
   Badge,
   Box,
@@ -9,14 +10,53 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material'
-import { Circle, Timeline } from '@mui/icons-material'
 import { useQueryClient } from '@tanstack/react-query'
 import { CippOffCanvas } from './CippOffCanvas'
 import { ApiGetCall } from '../../api/ApiCall'
+import { useCraftJobEvents } from '../../hooks/use-craft-events'
+import { fromCraftRun } from '../../utils/craft-run'
 
 // Terminal states, i.e. nothing more will happen to this queue.
 const isFinished = (status) =>
   ['Completed', 'Failed', 'Completed (with errors)', 'Not found'].includes(status)
+
+const sameId = (a, b) => String(a).toLowerCase() === String(b).toLowerCase()
+
+/**
+ * Put one queue's pushed entry in place and re-derive the roll-up as ListCippQueues does: summed task
+ * counts, and the least complete state across the set.
+ */
+export const withQueue = (old, queueId, entry) => {
+  const queues = old.Queues ?? []
+  const known = queues.some((q) => sameId(q.QueueId, queueId))
+  const next = known
+    ? queues.map((q) => (sameId(q.QueueId, queueId) ? { ...q, ...entry } : q))
+    : [...queues, { ...entry, QueueId: queueId }]
+  const sum = (field) => next.reduce((total, q) => total + (Number(q[field]) || 0), 0)
+  const running = next.filter((q) => !isFinished(q.Status)).length
+  const failed = next.filter((q) => ['Failed', 'Completed (with errors)'].includes(q.Status)).length
+  const totalTasks = sum('TotalTasks')
+  const completedTasks = sum('CompletedTasks')
+  return {
+    ...old,
+    Queues: next,
+    MissingQueueIds: (old.MissingQueueIds ?? []).filter((id) => !sameId(id, queueId)),
+    Summary: {
+      ...old.Summary,
+      FoundQueues: next.length,
+      RunningQueues: running,
+      FailedQueues: failed,
+      CompletedQueues: next.length - running - next.filter((q) => q.Status === 'Failed').length,
+      TotalTasks: totalTasks,
+      CompletedTasks: completedTasks,
+      RunningTasks: sum('RunningTasks'),
+      FailedTasks: sum('FailedTasks'),
+      PercentComplete: totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 1000) / 10 : 0,
+      IsComplete: running === 0,
+      Status: running ? 'Running' : failed ? 'Completed (with errors)' : 'Completed',
+    },
+  }
+}
 
 const statusColour = (status) => {
   if (status === 'Completed') return 'success.main'
@@ -35,7 +75,12 @@ const statusColour = (status) => {
  * invalidated once, so the page showing the data refreshes itself rather than leaving the admin
  * looking at pre-sync numbers.
  */
-export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], label = 'Sync' }) => {
+export const CippMultiQueueTracker = ({
+  queueIds = [],
+  relatedQueryKeys = [],
+  label = 'Sync',
+  details = null,
+}) => {
   const queryClient = useQueryClient()
   const [canvasVisible, setCanvasVisible] = useState(false)
   const [hasInvalidated, setHasInvalidated] = useState(false)
@@ -43,12 +88,25 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
   const ids = Array.isArray(queueIds) ? queueIds.filter(Boolean) : []
   const idKey = ids.join(',')
 
+  const connected = useCraftJobEvents(ids, (frame) => {
+    if (!frame.data) {
+      polling.refetch()
+      return
+    }
+    queryClient.setQueryData([`CippQueues-${idKey || 'none'}`], (old) =>
+      old ? withQueue(old, frame.jobId, fromCraftRun(frame.data)) : old
+    )
+  })
   const polling = ApiGetCall({
     url: '/api/ListCippQueues',
     data: { QueueIds: idKey },
     queryKey: `CippQueues-${idKey || 'none'}`,
     waiting: ids.length > 0,
-    refetchInterval: (data) => (isFinished(data?.Summary?.Status) ? false : 3000),
+    // TanStack Query v5 hands this callback the Query object, not the data. Reading the data
+    // off query.state is what makes the interval actually return false on completion - with
+    // the v4 (data) signature the status is never found and the poll runs forever.
+    refetchInterval: (query) =>
+      isFinished(query?.state?.data?.Summary?.Status) || connected ? false : 3000,
     refetchOnWindowFocus: false,
     staleTime: 0,
   })
@@ -82,7 +140,7 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
     <>
       <Tooltip title={tooltip}>
         <Badge
-          badgeContent={<Circle sx={{ fontSize: 8, color: statusColour(summary?.Status) }} />}
+          badgeContent={<CippIcons.Circle sx={{ fontSize: 8, color: statusColour(summary?.Status) }} />}
           overlap="circular"
           anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
         >
@@ -98,7 +156,7 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
               },
             }}
           >
-            <Timeline />
+            <CippIcons.Timeline />
           </IconButton>
         </Badge>
       </Tooltip>
@@ -111,7 +169,9 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
       >
         <Stack spacing={3}>
           <Box>
-            <Typography variant="body2" color="text.secondary" gutterBottom>
+            <Typography variant="body2" gutterBottom sx={{
+              color: "text.secondary"
+            }}>
               {summary?.Status ?? 'Starting'} — {percent}% complete
             </Typography>
             <LinearProgress
@@ -121,7 +181,9 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
             />
           </Box>
 
-          <Stack direction="row" spacing={3} flexWrap="wrap" useFlexGap>
+          <Stack direction="row" spacing={3} useFlexGap sx={{
+            flexWrap: "wrap"
+          }}>
             <Typography variant="body2">
               <strong>Caches:</strong> {summary?.FoundQueues ?? 0} of {summary?.TotalQueues ?? 0}
             </Typography>
@@ -143,8 +205,15 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
                 key={queue.RowKey}
                 sx={{ p: 2, border: 1, borderColor: 'divider', borderRadius: 1 }}
               >
-                <Stack direction="row" justifyContent="space-between" alignItems="center">
-                  <Typography variant="body2" fontWeight="medium">
+                <Stack
+                  direction="row"
+                  sx={{
+                    justifyContent: "space-between",
+                    alignItems: "center"
+                  }}>
+                  <Typography variant="body2" sx={{
+                    fontWeight: "medium"
+                  }}>
                     {queue.Name}
                   </Typography>
                   <Chip
@@ -162,7 +231,9 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
                     }
                   />
                 </Stack>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   {queue.CompletedTasks ?? 0} of {queue.TotalTasks ?? 0} tasks
                   {queue.FailedTasks > 0 ? ` — ${queue.FailedTasks} failed` : ''}
                 </Typography>
@@ -174,14 +245,20 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
               </Box>
             ))}
             {queues.length === 0 && (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: "text.secondary"
+              }}>
                 {polling.isFetching ? 'Loading queue status…' : 'No queue data available yet.'}
               </Typography>
             )}
           </Stack>
 
+          {details}
+
           {summary?.TotalQueues > summary?.FoundQueues && (
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: "text.secondary"
+            }}>
               {summary.TotalQueues - summary.FoundQueues} queue(s) could not be found. They may have
               finished and aged out of the queue history, or failed to start.
             </Typography>
@@ -189,7 +266,7 @@ export const CippMultiQueueTracker = ({ queueIds = [], relatedQueryKeys = [], la
         </Stack>
       </CippOffCanvas>
     </>
-  )
+  );
 }
 
 export default CippMultiQueueTracker

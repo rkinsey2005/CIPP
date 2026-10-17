@@ -1,5 +1,5 @@
 import { IconButton, SvgIcon, Tooltip } from '@mui/material'
-import { ArrowPathIcon } from '@heroicons/react/24/outline'
+import { CippIcons } from '../../utils/icon-registry'
 import { useQueryClient } from '@tanstack/react-query'
 
 /**
@@ -33,11 +33,11 @@ export const CippQueryRefreshButton = ({
               animation: isFetching ? 'spin 1s linear infinite' : 'none',
               '@keyframes spin': {
                 '0%': { transform: 'rotate(0deg)' },
-                '100%': { transform: 'rotate(-360deg)' },
+                '100%': { transform: 'rotate(360deg)' },
               },
             }}
           >
-            <ArrowPathIcon />
+            <CippIcons.ArrowPathIcon />
           </SvgIcon>
         </IconButton>
       </span>
